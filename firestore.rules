@@ -1,0 +1,787 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Primitive Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function hasVerifiedEmail() {
+      return isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.email is string;
+    }
+
+    // Platform Super Admin & Application Owner email provisioned from runtime
+    function isPlatformSuperAdmin() {
+      return hasVerifiedEmail() && request.auth.token.email == 'storelinnhtet@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidTimestamp(ts) {
+      return ts is timestamp && ts <= request.time;
+    }
+
+    function isValidRole(role) {
+      return role in [
+        'SUPER_ADMIN',
+        'GENERAL_MANAGER',
+        'BRANCH_MANAGER',
+        'CASHIER',
+        'INVENTORY_STAFF',
+        'ACCOUNTANT',
+        'HR_PAYROLL_STAFF'
+      ];
+    }
+
+    function isValidAccountStatus(status) {
+      return status in ['PENDING', 'APPROVED', 'SUSPENDED', 'REVOKED'];
+    }
+
+    function isValidSubscriptionStatus(status) {
+      return status in [
+        'PENDING_PAYMENT',
+        'PENDING_APPROVAL',
+        'ACTIVE',
+        'EXPIRING_SOON',
+        'EXPIRED',
+        'SUSPENDED',
+        'CANCELLED'
+      ];
+    }
+
+    function isCompanyOwner(companyId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/companies/$(companyId)) &&
+        get(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid;
+    }
+
+    function isApprovedMember(companyId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data.status == 'APPROVED';
+    }
+
+    function isCompanyAdmin(companyId) {
+      return isApprovedMember(companyId) &&
+        get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data.role in ['SUPER_ADMIN', 'GENERAL_MANAGER'];
+    }
+
+    // Trusted Server-Time Subscription Validation (cannot be bypassed by device clock!)
+    function isSubscriptionOperational(companyId) {
+      let comp = get(/databases/$(database)/documents/companies/$(companyId)).data;
+      return comp.subscriptionStatus in ['ACTIVE', 'EXPIRING_SOON'] &&
+        comp.subscriptionExpiresAt is timestamp &&
+        comp.subscriptionExpiresAt > request.time;
+    }
+
+    // --- Validation Blueprints ---
+    function isValidUserProfile(data, userId) {
+      return data.userId is string && data.userId == userId &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        (!('photoUrl' in data) || data.photoUrl == null || (data.photoUrl is string && data.photoUrl.size() <= 500)) &&
+        (!('activeCompanyId' in data) || data.activeCompanyId == null || (data.activeCompanyId is string && data.activeCompanyId.size() <= 128)) &&
+        (!('lastServerTimeAt' in data) || data.lastServerTimeAt == null || data.lastServerTimeAt is timestamp) &&
+        data.preferredLanguage in ['my', 'en'] &&
+        data.preferredTheme in ['system', 'light', 'dark'];
+    }
+
+    function isValidSubscriptionPlan(data) {
+      return data.nameEn is string && data.nameEn.size() >= 2 && data.nameEn.size() <= 100 &&
+        data.nameMm is string && data.nameMm.size() >= 1 && data.nameMm.size() <= 140 &&
+        (!('descriptionEn' in data) || data.descriptionEn is string && data.descriptionEn.size() <= 300) &&
+        (!('descriptionMm' in data) || data.descriptionMm is string && data.descriptionMm.size() <= 400) &&
+        data.durationMonths is int && data.durationMonths >= 1 && data.durationMonths <= 60 &&
+        data.durationDays is int && data.durationDays >= 1 && data.durationDays <= 2000 &&
+        data.priceMmk is int && data.priceMmk >= 0 && data.priceMmk <= 500000000 &&
+        (data.discountPercent is int || data.discountPercent is float) &&
+        data.discountPercent >= 0 && data.discountPercent <= 100 &&
+        data.promoPriceMmk is int && data.promoPriceMmk >= 0 && data.promoPriceMmk <= data.priceMmk &&
+        (!('promoLabel' in data) || data.promoLabel == null || (data.promoLabel is string && data.promoLabel.size() <= 60)) &&
+        data.maxBranches is int && data.maxBranches >= 1 && data.maxBranches <= 1000 &&
+        data.maxEmployees is int && data.maxEmployees >= 1 && data.maxEmployees <= 10000 &&
+        data.enabledFeatures is list && data.enabledFeatures.size() <= 20 &&
+        data.isActive is bool &&
+        data.sortOrder is int && data.sortOrder >= 0 &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    function isValidPaymentMethod(data) {
+      return data.nameEn is string && data.nameEn.size() >= 2 && data.nameEn.size() <= 80 &&
+        data.nameMm is string && data.nameMm.size() >= 1 && data.nameMm.size() <= 120 &&
+        data.providerType in ['MANUAL_TRANSFER', 'GATEWAY_WEBHOOK'] &&
+        data.accountTitle is string && data.accountTitle.size() <= 120 &&
+        data.accountNumber is string && data.accountNumber.size() <= 80 &&
+        data.instructionsEn is string && data.instructionsEn.size() <= 300 &&
+        data.instructionsMm is string && data.instructionsMm.size() <= 400 &&
+        (!('gatewayEndpoint' in data) || data.gatewayEndpoint == null || (data.gatewayEndpoint is string && data.gatewayEndpoint.size() <= 250)) &&
+        data.isActive is bool &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    function isValidSubscriptionPayment(data) {
+      return data.companyId is string && isValidId(data.companyId) &&
+        data.companyName is string && data.companyName.size() >= 1 && data.companyName.size() <= 150 &&
+        data.ownerUid is string && isValidId(data.ownerUid) &&
+        data.ownerName is string && data.ownerName.size() >= 1 && data.ownerName.size() <= 120 &&
+        data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 200 &&
+        data.planId is string && isValidId(data.planId) &&
+        data.planNameEn is string && data.planNameEn.size() >= 1 && data.planNameEn.size() <= 100 &&
+        data.planNameMm is string && data.planNameMm.size() >= 1 && data.planNameMm.size() <= 140 &&
+        data.durationMonths is int && data.durationMonths >= 1 &&
+        data.durationDays is int && data.durationDays >= 1 &&
+        data.amountMmk is int && data.amountMmk >= 0 && data.amountMmk <= 500000000 &&
+        data.paymentMethodId is string && isValidId(data.paymentMethodId) &&
+        data.paymentMethodName is string && data.paymentMethodName.size() >= 1 && data.paymentMethodName.size() <= 100 &&
+        data.transactionRef is string && data.transactionRef.size() >= 2 && data.transactionRef.size() <= 120 &&
+        data.paymentDateText is string && data.paymentDateText.size() >= 4 && data.paymentDateText.size() <= 60 &&
+        (!('proofImageBase64' in data) || data.proofImageBase64 == null || (data.proofImageBase64 is string && data.proofImageBase64.size() <= 350000)) &&
+        (!('proofStorageUrl' in data) || data.proofStorageUrl == null || (data.proofStorageUrl is string && data.proofStorageUrl.size() <= 500)) &&
+        data.status in ['PENDING_VERIFICATION', 'VERIFIED', 'REJECTED'] &&
+        data.receiptNumber is string && data.receiptNumber.size() <= 80 &&
+        (!('rejectionReason' in data) || data.rejectionReason == null || (data.rejectionReason is string && data.rejectionReason.size() <= 300)) &&
+        (!('grantedStartAt' in data) || data.grantedStartAt == null || data.grantedStartAt is timestamp) &&
+        (!('grantedExpiresAt' in data) || data.grantedExpiresAt == null || data.grantedExpiresAt is timestamp) &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    function isValidAccountDirectory(data) {
+      return data.companyId is string && isValidId(data.companyId) &&
+        data.ownerUid is string && isValidId(data.ownerUid) &&
+        data.employeeId is string && data.employeeId.size() >= 2 && data.employeeId.size() <= 32 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        data.phone is string && data.phone.size() <= 40 &&
+        isValidRole(data.role) &&
+        isValidAccountStatus(data.status) &&
+        data.allBranchesAccess is bool &&
+        data.assignedBranchIds is list && data.assignedBranchIds.size() <= 50 &&
+        (data.assignedBranchIds.size() == 0 || data.assignedBranchIds[0] is string) &&
+        (!('linkedUid' in data) || data.linkedUid == null || (data.linkedUid is string && data.linkedUid.size() <= 128)) &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    function isValidCompany(data) {
+      return data.ownerUid is string && isValidId(data.ownerUid) &&
+        data.ownerName is string && data.ownerName.size() >= 1 && data.ownerName.size() <= 120 &&
+        data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 200 &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 120 &&
+        data.nameMm is string && data.nameMm.size() >= 1 && data.nameMm.size() <= 150 &&
+        data.phone is string && data.phone.size() <= 40 &&
+        data.address is string && data.address.size() <= 300 &&
+        (!('taxId' in data) || data.taxId == null || (data.taxId is string && data.taxId.size() <= 60)) &&
+        data.currency == 'MMK' &&
+        data.defaultLanguage in ['my', 'en'] &&
+        (data.taxRatePercent is int || data.taxRatePercent is float) &&
+        data.taxRatePercent >= 0 && data.taxRatePercent <= 50 &&
+        data.allowNegativeStock is bool &&
+        data.offlineLimitMmk is int && data.offlineLimitMmk >= 0 && data.offlineLimitMmk <= 100000000 &&
+        data.subscriptionPlanId is string && data.subscriptionPlanId.size() <= 128 &&
+        data.subscriptionPlanName is string && data.subscriptionPlanName.size() <= 120 &&
+        isValidSubscriptionStatus(data.subscriptionStatus) &&
+        (!('subscriptionStartAt' in data) || data.subscriptionStartAt == null || data.subscriptionStartAt is timestamp) &&
+        (!('subscriptionExpiresAt' in data) || data.subscriptionExpiresAt == null || data.subscriptionExpiresAt is timestamp) &&
+        data.maxBranchesAllowed is int && data.maxBranchesAllowed >= 1 && data.maxBranchesAllowed <= 1000 &&
+        data.maxEmployeesAllowed is int && data.maxEmployeesAllowed >= 1 && data.maxEmployeesAllowed <= 10000 &&
+        data.enabledFeatures is list && data.enabledFeatures.size() <= 20 &&
+        data.activeBranchCount is int && data.activeBranchCount >= 0 &&
+        data.activeEmployeeCount is int && data.activeEmployeeCount >= 0 &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    function isValidCompanyMember(data, companyId) {
+      return data.companyId is string && data.companyId == companyId &&
+        data.ownerUid is string && isValidId(data.ownerUid) &&
+        data.userId is string && isValidId(data.userId) &&
+        data.employeeId is string && data.employeeId.size() >= 2 && data.employeeId.size() <= 32 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        (!('phone' in data) || data.phone == null || (data.phone is string && data.phone.size() <= 40)) &&
+        isValidRole(data.role) &&
+        isValidAccountStatus(data.status) &&
+        data.allBranchesAccess is bool &&
+        data.assignedBranchIds is list && data.assignedBranchIds.size() <= 50 &&
+        (data.assignedBranchIds.size() == 0 || data.assignedBranchIds[0] is string) &&
+        data.adminUids is list && data.adminUids.size() <= 20 &&
+        (data.adminUids.size() == 0 || data.adminUids[0] is string) &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    function isValidBranch(data, companyId) {
+      return data.companyId is string && data.companyId == companyId &&
+        data.ownerUid is string && isValidId(data.ownerUid) &&
+        data.code is string && data.code.size() >= 2 && data.code.size() <= 24 &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 120 &&
+        data.nameMm is string && data.nameMm.size() >= 1 && data.nameMm.size() <= 150 &&
+        data.address is string && data.address.size() <= 300 &&
+        data.phone is string && data.phone.size() <= 40 &&
+        (!('managerUid' in data) || data.managerUid == null || (data.managerUid is string && data.managerUid.size() <= 128)) &&
+        (!('managerName' in data) || data.managerName == null || (data.managerName is string && data.managerName.size() <= 100)) &&
+        data.isHeadOffice is bool &&
+        data.isActive is bool &&
+        data.memberUids is list && data.memberUids.size() <= 150 &&
+        (data.memberUids.size() == 0 || data.memberUids[0] is string) &&
+        data.todaySalesMmk is int && data.todaySalesMmk >= 0 &&
+        data.todayProfitMmk is int &&
+        data.todayExpensesMmk is int && data.todayExpensesMmk >= 0 &&
+        data.todayTransactions is int && data.todayTransactions >= 0 &&
+        data.productCount is int && data.productCount >= 0 &&
+        data.customerCount is int && data.customerCount >= 0 &&
+        data.outstandingDebtMmk is int && data.outstandingDebtMmk >= 0 &&
+        data.inventoryValueMmk is int && data.inventoryValueMmk >= 0 &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    function isValidDailySummary(data, companyId, branchId) {
+      return data.companyId is string && data.companyId == companyId &&
+        data.branchId is string && data.branchId == branchId &&
+        data.ownerUid is string && isValidId(data.ownerUid) &&
+        data.dateKey is string && data.dateKey.matches('^\\d{4}-\\d{2}-\\d{2}$') &&
+        data.salesMmk is int && data.salesMmk >= 0 &&
+        data.cogsMmk is int && data.cogsMmk >= 0 &&
+        data.grossProfitMmk is int &&
+        data.expensesMmk is int && data.expensesMmk >= 0 &&
+        data.netProfitMmk is int &&
+        data.transactionCount is int && data.transactionCount >= 0 &&
+        data.memberUids is list && data.memberUids.size() <= 150 &&
+        (data.memberUids.size() == 0 || data.memberUids[0] is string) &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    function isValidAuditLog(data, companyId) {
+      return data.companyId is string && data.companyId == companyId &&
+        (!('branchId' in data) || data.branchId == null || (data.branchId is string && data.branchId.size() <= 128)) &&
+        data.actorUid is string && data.actorUid == request.auth.uid &&
+        data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 100 &&
+        data.action is string && data.action.size() >= 2 && data.action.size() <= 64 &&
+        data.targetType is string && data.targetType.size() >= 2 && data.targetType.size() <= 64 &&
+        data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 128 &&
+        data.details is string && data.details.size() <= 500 &&
+        data.adminUids is list && data.adminUids.size() <= 20 &&
+        (data.adminUids.size() == 0 || data.adminUids[0] is string) &&
+        data.createdBy is string && data.createdBy == request.auth.uid;
+    }
+
+    function isValidPlatformAuditLog(data) {
+      return data.companyId is string && data.companyId.size() <= 128 &&
+        data.ownerUid is string && data.ownerUid.size() <= 128 &&
+        data.actorUid is string && data.actorUid == request.auth.uid &&
+        data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 120 &&
+        data.actorRole is string && data.actorRole.size() >= 2 && data.actorRole.size() <= 40 &&
+        data.action is string && data.action.size() >= 2 && data.action.size() <= 64 &&
+        data.targetType is string && data.targetType.size() >= 2 && data.targetType.size() <= 64 &&
+        data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 128 &&
+        data.details is string && data.details.size() <= 500 &&
+        data.createdBy is string && data.createdBy == request.auth.uid;
+    }
+
+    function isValidNotification(data, companyId) {
+      return data.companyId is string && data.companyId == companyId &&
+        data.branchId is string && data.branchId.size() <= 128 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.titleMm is string && data.titleMm.size() >= 1 && data.titleMm.size() <= 160 &&
+        data.message is string && data.message.size() >= 1 && data.message.size() <= 500 &&
+        data.messageMm is string && data.messageMm.size() >= 1 && data.messageMm.size() <= 600 &&
+        data.severity in ['INFO', 'WARNING', 'CRITICAL'] &&
+        data.category is string && data.category.size() >= 2 && data.category.size() <= 40 &&
+        data.isRead is bool &&
+        data.memberUids is list && data.memberUids.size() <= 150 &&
+        (data.memberUids.size() == 0 || data.memberUids[0] is string) &&
+        data.createdBy is string && isValidId(data.createdBy);
+    }
+
+    // --- /users/{userId} ---
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if isSignedIn() && request.auth.uid == userId;
+
+      allow create: if isSignedIn() &&
+        isValidId(userId) &&
+        request.auth.uid == userId &&
+        incoming().keys().hasAll(['userId', 'email', 'displayName', 'preferredLanguage', 'preferredTheme', 'createdAt', 'updatedAt']) &&
+        incoming().keys().hasOnly(['userId', 'email', 'displayName', 'photoUrl', 'activeCompanyId', 'preferredLanguage', 'preferredTheme', 'lastServerTimeAt', 'createdAt', 'updatedAt']) &&
+        isValidUserProfile(incoming(), userId) &&
+        isValidTimestamp(incoming().createdAt) &&
+        isValidTimestamp(incoming().updatedAt);
+
+      allow update: if isSignedIn() &&
+        isValidId(userId) &&
+        request.auth.uid == userId &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        isValidTimestamp(incoming().updatedAt) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'photoUrl', 'activeCompanyId', 'preferredLanguage', 'preferredTheme', 'lastServerTimeAt', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    // --- /subscription_plans/{planId} (GLOBAL SAAS PLANS - SUPER ADMIN ONLY WRITES) ---
+    match /subscription_plans/{planId} {
+      allow get, list: if isSignedIn();
+      allow create: if isPlatformSuperAdmin() &&
+        isValidId(planId) &&
+        incoming().keys().hasAll(['nameEn', 'nameMm', 'durationMonths', 'durationDays', 'priceMmk', 'discountPercent', 'promoPriceMmk', 'maxBranches', 'maxEmployees', 'enabledFeatures', 'isActive', 'sortOrder', 'createdBy', 'createdAt', 'updatedAt']) &&
+        incoming().createdBy == request.auth.uid &&
+        isValidSubscriptionPlan(incoming()) &&
+        isValidTimestamp(incoming().createdAt) &&
+        isValidTimestamp(incoming().updatedAt);
+
+      allow update: if isPlatformSuperAdmin() &&
+        isValidId(planId) &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        isValidSubscriptionPlan(incoming()) &&
+        isValidTimestamp(incoming().updatedAt);
+
+      allow delete: if isPlatformSuperAdmin();
+    }
+
+    // --- /payment_methods/{methodId} (CONFIGURABLE PAYMENT METHODS - SUPER ADMIN ONLY WRITES) ---
+    match /payment_methods/{methodId} {
+      allow get, list: if isSignedIn();
+      allow create: if isPlatformSuperAdmin() &&
+        isValidId(methodId) &&
+        incoming().createdBy == request.auth.uid &&
+        isValidPaymentMethod(incoming()) &&
+        isValidTimestamp(incoming().createdAt) &&
+        isValidTimestamp(incoming().updatedAt);
+
+      allow update: if isPlatformSuperAdmin() &&
+        isValidId(methodId) &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        isValidPaymentMethod(incoming()) &&
+        isValidTimestamp(incoming().updatedAt);
+
+      allow delete: if isPlatformSuperAdmin();
+    }
+
+    // --- /subscription_payments/{paymentId} ---
+    match /subscription_payments/{paymentId} {
+      allow get: if isPlatformSuperAdmin() || (isSignedIn() && existing().ownerUid == request.auth.uid);
+      allow list: if isPlatformSuperAdmin() || (isSignedIn() && existing().ownerUid == request.auth.uid);
+
+      // Business Owner submits payment proof ONLY as PENDING_VERIFICATION (cannot self-verify!)
+      allow create: if isSignedIn() &&
+        isValidId(paymentId) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().status == 'PENDING_VERIFICATION' &&
+        incoming().receiptNumber == '' &&
+        !('verifiedByUid' in incoming() && incoming().verifiedByUid != null) &&
+        !('grantedStartAt' in incoming() && incoming().grantedStartAt != null) &&
+        !('grantedExpiresAt' in incoming() && incoming().grantedExpiresAt != null) &&
+        isValidSubscriptionPayment(incoming()) &&
+        isValidTimestamp(incoming().createdAt) &&
+        isValidTimestamp(incoming().updatedAt) &&
+        (
+          isCompanyOwner(incoming().companyId) ||
+          getAfter(/databases/$(database)/documents/companies/$(incoming().companyId)).data.ownerUid == request.auth.uid
+        );
+
+      // ONLY Platform Super Admin can approve/verify or reject payment
+      allow update: if isPlatformSuperAdmin() &&
+        isValidId(paymentId) &&
+        isValidSubscriptionPayment(incoming()) &&
+        incoming().companyId == existing().companyId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        isValidTimestamp(incoming().updatedAt);
+
+      allow delete: if false;
+    }
+
+    // --- /platform_audit_logs/{logId} ---
+    match /platform_audit_logs/{logId} {
+      allow get, list: if isPlatformSuperAdmin() || (isSignedIn() && existing().ownerUid == request.auth.uid);
+      allow create: if isSignedIn() &&
+        isValidId(logId) &&
+        isValidPlatformAuditLog(incoming()) &&
+        isValidTimestamp(incoming().createdAt) &&
+        (
+          isPlatformSuperAdmin() ||
+          incoming().action in ['BUSINESS_REGISTERED', 'PAYMENT_SUBMITTED']
+        );
+      allow update, delete: if false;
+    }
+
+    // --- /account_directory/{emailKey} ---
+    match /account_directory/{emailKey} {
+      allow get: if isSignedIn() && isValidId(emailKey) && (
+        isPlatformSuperAdmin() ||
+        existing().ownerUid == request.auth.uid ||
+        (hasVerifiedEmail() && existing().email == request.auth.token.email.lower())
+      );
+
+      allow list: if isPlatformSuperAdmin() || (isSignedIn() && existing().ownerUid == request.auth.uid);
+
+      allow create: if isSignedIn() &&
+        isValidId(emailKey) &&
+        incoming().keys().hasAll(['companyId', 'ownerUid', 'employeeId', 'email', 'displayName', 'phone', 'role', 'status', 'allBranchesAccess', 'assignedBranchIds', 'createdBy', 'createdAt', 'updatedAt']) &&
+        incoming().keys().hasOnly(['companyId', 'ownerUid', 'employeeId', 'email', 'displayName', 'phone', 'role', 'status', 'allBranchesAccess', 'assignedBranchIds', 'linkedUid', 'createdBy', 'createdAt', 'updatedAt']) &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().ownerUid == request.auth.uid &&
+        isValidAccountDirectory(incoming()) &&
+        isValidTimestamp(incoming().createdAt) &&
+        isValidTimestamp(incoming().updatedAt) &&
+        (
+          (isCompanyOwner(incoming().companyId) && isSubscriptionOperational(incoming().companyId)) ||
+          (!exists(/databases/$(database)/documents/companies/$(incoming().companyId)) &&
+           getAfter(/databases/$(database)/documents/companies/$(incoming().companyId)).data.ownerUid == request.auth.uid)
+        );
+
+      allow update: if isSignedIn() &&
+        isValidId(emailKey) &&
+        isValidAccountDirectory(incoming()) &&
+        incoming().companyId == existing().companyId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().email == existing().email &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        isValidTimestamp(incoming().updatedAt) &&
+        (
+          (
+            existing().ownerUid == request.auth.uid &&
+            isCompanyOwner(existing().companyId) &&
+            !(existing().email == request.auth.token.email.lower() && (incoming().role != 'SUPER_ADMIN' || incoming().status != 'APPROVED')) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['employeeId', 'displayName', 'phone', 'role', 'status', 'allBranchesAccess', 'assignedBranchIds', 'linkedUid', 'updatedAt'])
+          ) ||
+          (
+            hasVerifiedEmail() &&
+            existing().email == request.auth.token.email.lower() &&
+            existing().status == 'APPROVED' &&
+            incoming().linkedUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['linkedUid', 'updatedAt'])
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // --- /companies/{companyId} ---
+    match /companies/{companyId} {
+      // Business Owners & Platform Super Admin can always inspect company subscription status;
+      // Employees can read ONLY if approved AND business subscription is active!
+      allow get: if isSignedIn() && isValidId(companyId) && (
+        isPlatformSuperAdmin() ||
+        existing().ownerUid == request.auth.uid ||
+        (isApprovedMember(companyId) && isSubscriptionOperational(companyId))
+      );
+      allow list: if isPlatformSuperAdmin() || (isSignedIn() && existing().ownerUid == request.auth.uid);
+
+      // Platform Super Admin creates ACTIVE enterprise company;
+      // Customer Business Owner can ONLY register with PENDING_PAYMENT / PENDING_APPROVAL (no free access bypass!)
+      allow create: if hasVerifiedEmail() &&
+        isValidId(companyId) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdBy == request.auth.uid &&
+        isValidCompany(incoming()) &&
+        isValidTimestamp(incoming().createdAt) &&
+        isValidTimestamp(incoming().updatedAt) &&
+        (
+          isPlatformSuperAdmin() ||
+          (
+            incoming().subscriptionStatus in ['PENDING_PAYMENT', 'PENDING_APPROVAL'] &&
+            (!('subscriptionExpiresAt' in incoming()) || incoming().subscriptionExpiresAt == null) &&
+            incoming().maxBranchesAllowed == 1 &&
+            incoming().maxEmployeesAllowed <= 5
+          )
+        );
+
+      allow update: if isSignedIn() &&
+        isValidId(companyId) &&
+        isValidCompany(incoming()) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        isValidTimestamp(incoming().updatedAt) &&
+        (
+          // ONLY Platform Super Admin can alter subscription status, plan, expiry timestamps, or plan limits!
+          isPlatformSuperAdmin() ||
+          (
+            (existing().ownerUid == request.auth.uid || isCompanyAdmin(companyId)) &&
+            // Owners can set PENDING_APPROVAL only when submitting a renewal payment (cannot activate or extend expiry!)
+            (
+              incoming().subscriptionPlanId == existing().subscriptionPlanId &&
+              incoming().subscriptionPlanName == existing().subscriptionPlanName &&
+              incoming().get('subscriptionStartAt', null) == existing().get('subscriptionStartAt', null) &&
+              incoming().get('subscriptionExpiresAt', null) == existing().get('subscriptionExpiresAt', null) &&
+              incoming().maxBranchesAllowed == existing().maxBranchesAllowed &&
+              incoming().maxEmployeesAllowed == existing().maxEmployeesAllowed &&
+              incoming().enabledFeatures == existing().enabledFeatures &&
+              (
+                incoming().subscriptionStatus == existing().subscriptionStatus ||
+                (existing().subscriptionStatus in ['PENDING_PAYMENT', 'EXPIRED'] && incoming().subscriptionStatus == 'PENDING_APPROVAL')
+              )
+            ) &&
+            incoming().activeBranchCount <= existing().maxBranchesAllowed &&
+            incoming().activeEmployeeCount <= existing().maxEmployeesAllowed &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'nameMm', 'phone', 'address', 'taxId',
+              'defaultLanguage', 'taxRatePercent', 'allowNegativeStock', 'offlineLimitMmk',
+              'subscriptionStatus', 'activeBranchCount', 'activeEmployeeCount',
+              'expiryNotified7d', 'expiryNotified3d', 'expiryNotified1d', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if false;
+
+      // --- /companies/{companyId}/members/{memberId} ---
+      match /members/{memberId} {
+        allow get: if isSignedIn() && isValidId(companyId) && isValidId(memberId) && (
+          isPlatformSuperAdmin() ||
+          request.auth.uid == memberId ||
+          existing().ownerUid == request.auth.uid ||
+          request.auth.uid in existing().adminUids
+        );
+        allow list: if isPlatformSuperAdmin() || (isSignedIn() &&
+          (existing().ownerUid == request.auth.uid || request.auth.uid in existing().adminUids));
+
+        allow create: if isSignedIn() &&
+          isValidId(companyId) &&
+          isValidId(memberId) &&
+          incoming().createdBy == request.auth.uid &&
+          isValidCompanyMember(incoming(), companyId) &&
+          isValidTimestamp(incoming().createdAt) &&
+          isValidTimestamp(incoming().updatedAt) &&
+          (
+            // 1. Business Owner bootstrap during company/business creation
+            (
+              hasVerifiedEmail() &&
+              !exists(/databases/$(database)/documents/companies/$(companyId)) &&
+              memberId == request.auth.uid &&
+              incoming().userId == request.auth.uid &&
+              incoming().ownerUid == request.auth.uid &&
+              incoming().role == 'SUPER_ADMIN' &&
+              incoming().status == 'APPROVED' &&
+              incoming().allBranchesAccess == true &&
+              request.auth.uid in incoming().adminUids &&
+              getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid
+            ) ||
+            // 2. Owner directly creating an approved member doc (requires active subscription)
+            (
+              isCompanyOwner(companyId) &&
+              isSubscriptionOperational(companyId) &&
+              incoming().ownerUid == request.auth.uid
+            ) ||
+            // 3. Approved employee claiming their UID doc matching an APPROVED account_directory record & active subscription
+            (
+              hasVerifiedEmail() &&
+              isSubscriptionOperational(companyId) &&
+              memberId == request.auth.uid &&
+              incoming().userId == request.auth.uid &&
+              incoming().status == 'APPROVED' &&
+              incoming().email == request.auth.token.email.lower() &&
+              exists(/databases/$(database)/documents/account_directory/$(incoming().email.replace('[^a-zA-Z0-9_\\-]', '_'))) &&
+              get(/databases/$(database)/documents/account_directory/$(incoming().email.replace('[^a-zA-Z0-9_\\-]', '_'))).data.status == 'APPROVED' &&
+              get(/databases/$(database)/documents/account_directory/$(incoming().email.replace('[^a-zA-Z0-9_\\-]', '_'))).data.companyId == companyId &&
+              get(/databases/$(database)/documents/account_directory/$(incoming().email.replace('[^a-zA-Z0-9_\\-]', '_'))).data.role == incoming().role &&
+              get(/databases/$(database)/documents/account_directory/$(incoming().email.replace('[^a-zA-Z0-9_\\-]', '_'))).data.allBranchesAccess == incoming().allBranchesAccess &&
+              get(/databases/$(database)/documents/account_directory/$(incoming().email.replace('[^a-zA-Z0-9_\\-]', '_'))).data.assignedBranchIds == incoming().assignedBranchIds
+            )
+          );
+
+        allow update: if isSignedIn() &&
+          isValidId(companyId) &&
+          isValidId(memberId) &&
+          isValidCompanyMember(incoming(), companyId) &&
+          incoming().companyId == existing().companyId &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().userId == existing().userId &&
+          incoming().createdBy == existing().createdBy &&
+          incoming().createdAt == existing().createdAt &&
+          isValidTimestamp(incoming().updatedAt) &&
+          (isCompanyOwner(companyId) || isPlatformSuperAdmin()) &&
+          !(existing().userId == existing().ownerUid && (incoming().role != 'SUPER_ADMIN' || incoming().status != 'APPROVED')) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['employeeId', 'displayName', 'phone', 'email', 'role', 'status', 'allBranchesAccess', 'assignedBranchIds', 'adminUids', 'updatedAt']);
+
+        allow delete: if isSignedIn() &&
+          isValidId(companyId) &&
+          isValidId(memberId) &&
+          isCompanyOwner(companyId) &&
+          existing().userId != existing().ownerUid;
+      }
+
+      // --- /companies/{companyId}/branches/{branchId} (STRICT SERVER-TIME SUBSCRIPTION GATE!) ---
+      match /branches/{branchId} {
+        allow get: if isSignedIn() && isValidId(companyId) && isValidId(branchId) && (
+          isPlatformSuperAdmin() ||
+          (
+            isSubscriptionOperational(companyId) &&
+            (existing().ownerUid == request.auth.uid || (request.auth.uid in existing().memberUids && isApprovedMember(companyId)))
+          )
+        );
+        allow list: if isSignedIn() && (
+          isPlatformSuperAdmin() ||
+          (
+            isSubscriptionOperational(companyId) &&
+            (existing().ownerUid == request.auth.uid || request.auth.uid in existing().memberUids)
+          )
+        );
+
+        allow create: if isSignedIn() &&
+          isValidId(companyId) &&
+          isValidId(branchId) &&
+          incoming().createdBy == request.auth.uid &&
+          isValidBranch(incoming(), companyId) &&
+          isValidTimestamp(incoming().createdAt) &&
+          isValidTimestamp(incoming().updatedAt) &&
+          (
+            // Initial HQ branch during company onboarding
+            (
+              hasVerifiedEmail() &&
+              !exists(/databases/$(database)/documents/companies/$(companyId)) &&
+              incoming().ownerUid == request.auth.uid &&
+              request.auth.uid in incoming().memberUids &&
+              getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid
+            ) ||
+            // Additional branch creation ONLY when subscription is active/not expired AND below quota
+            (
+              isCompanyAdmin(companyId) &&
+              isSubscriptionOperational(companyId) &&
+              incoming().ownerUid == get(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid
+            )
+          );
+
+        allow update: if isSignedIn() &&
+          isValidId(companyId) &&
+          isValidId(branchId) &&
+          isSubscriptionOperational(companyId) &&
+          isValidBranch(incoming(), companyId) &&
+          incoming().companyId == existing().companyId &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().createdBy == existing().createdBy &&
+          incoming().createdAt == existing().createdAt &&
+          isValidTimestamp(incoming().updatedAt) &&
+          (
+            (
+              isCompanyAdmin(companyId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['code', 'name', 'nameMm', 'address', 'phone', 'managerUid', 'managerName', 'isHeadOffice', 'isActive', 'memberUids', 'updatedAt'])
+            ) ||
+            (
+              isApprovedMember(companyId) &&
+              request.auth.uid in existing().memberUids &&
+              get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data.role == 'BRANCH_MANAGER' &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['phone', 'address', 'isActive', 'updatedAt'])
+            )
+          );
+
+        allow delete: if false;
+
+        match /daily_summaries/{summaryId} {
+          allow get: if isSignedIn() && (
+            isPlatformSuperAdmin() ||
+            (isSubscriptionOperational(companyId) && (existing().ownerUid == request.auth.uid || (request.auth.uid in existing().memberUids && isApprovedMember(companyId))))
+          );
+          allow list: if isSignedIn() && (
+            isPlatformSuperAdmin() ||
+            (isSubscriptionOperational(companyId) && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().memberUids))
+          );
+
+          allow create: if isSignedIn() &&
+            isSubscriptionOperational(companyId) &&
+            isValidDailySummary(incoming(), companyId, branchId) &&
+            isValidTimestamp(incoming().createdAt) &&
+            isValidTimestamp(incoming().updatedAt) &&
+            isCompanyAdmin(companyId);
+
+          allow update: if isSignedIn() &&
+            isSubscriptionOperational(companyId) &&
+            isValidDailySummary(incoming(), companyId, branchId) &&
+            incoming().companyId == existing().companyId &&
+            incoming().branchId == existing().branchId &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().dateKey == existing().dateKey &&
+            incoming().createdBy == existing().createdBy &&
+            incoming().createdAt == existing().createdAt &&
+            isValidTimestamp(incoming().updatedAt) &&
+            isCompanyAdmin(companyId) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['salesMmk', 'cogsMmk', 'grossProfitMmk', 'expensesMmk', 'netProfitMmk', 'transactionCount', 'memberUids', 'updatedAt']);
+
+          allow delete: if false;
+        }
+      }
+
+      // --- /companies/{companyId}/audit_logs/{logId} ---
+      match /audit_logs/{logId} {
+        allow get: if isSignedIn() && isValidId(companyId) && isValidId(logId) &&
+          (isPlatformSuperAdmin() || existing().actorUid == request.auth.uid || request.auth.uid in existing().adminUids);
+        allow list: if isSignedIn() &&
+          (isPlatformSuperAdmin() || existing().actorUid == request.auth.uid || request.auth.uid in existing().adminUids);
+
+        allow create: if isSignedIn() &&
+          isValidId(companyId) &&
+          isValidId(logId) &&
+          isValidAuditLog(incoming(), companyId) &&
+          isValidTimestamp(incoming().createdAt) &&
+          (
+            isPlatformSuperAdmin() ||
+            isApprovedMember(companyId) ||
+            (!exists(/databases/$(database)/documents/companies/$(companyId)) &&
+             getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid)
+          );
+
+        allow update, delete: if false;
+      }
+
+      // --- /companies/{companyId}/notifications/{notificationId} ---
+      match /notifications/{notificationId} {
+        // Owners always receive expiry, suspension, and payment verification alerts even when expired!
+        allow get: if isSignedIn() && isValidId(companyId) && isValidId(notificationId) &&
+          (isPlatformSuperAdmin() || (request.auth.uid in existing().memberUids && isApprovedMember(companyId)));
+        allow list: if isSignedIn() &&
+          (isPlatformSuperAdmin() || request.auth.uid in existing().memberUids);
+
+        allow create: if isSignedIn() &&
+          isValidId(companyId) &&
+          isValidId(notificationId) &&
+          incoming().createdBy == request.auth.uid &&
+          isValidNotification(incoming(), companyId) &&
+          isValidTimestamp(incoming().createdAt) &&
+          isValidTimestamp(incoming().updatedAt) &&
+          (
+            isPlatformSuperAdmin() ||
+            isCompanyAdmin(companyId) ||
+            (!exists(/databases/$(database)/documents/companies/$(companyId)) &&
+             getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid)
+          );
+
+        allow update: if isSignedIn() &&
+          isValidId(companyId) &&
+          isValidId(notificationId) &&
+          isValidNotification(incoming(), companyId) &&
+          incoming().companyId == existing().companyId &&
+          incoming().branchId == existing().branchId &&
+          incoming().createdBy == existing().createdBy &&
+          incoming().createdAt == existing().createdAt &&
+          isValidTimestamp(incoming().updatedAt) &&
+          isApprovedMember(companyId) &&
+          request.auth.uid in existing().memberUids &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['isRead', 'updatedAt']);
+
+        allow delete: if false;
+      }
+    }
+  }
+}
